@@ -22,7 +22,7 @@ log = logging.getLogger("maagbots")
 
 MODEL = "claude-opus-5"
 HISTORY_LIMIT = 20          # how many recent messages an agent reads before replying
-MAX_HOPS = 2                # agent-to-agent chains stop after this many replies
+MAX_HOPS = 3              # agent-to-agent chains stop after this many replies
 COOLDOWN_SECONDS = 60       # after an agent replies, the channel rests this long
 QUIET_SECONDS = 30 * 60     # how long `!quiet` silences every agent
 DISCORD_MAX_LENGTH = 2000   # Discord rejects longer messages
@@ -41,11 +41,11 @@ cooldown_until: dict[int, float] = {}       # channel id -> time the cooldown en
 quiet_until: dict[int, float] = {}          # channel id -> time `!quiet` ends
 
 
-def pick_agent(message: discord.Message) -> Agent | None:
+def pick_agent(message: discord.Message, channel_name: str) -> Agent | None:
     """Return the one agent that should answer this message, or None."""
     text = message.content.lower()
     for agent in agents:
-        if message.channel.name not in agent.channels:
+        if channel_name not in agent.channels:
             continue
         if agent.name == message.author.name:
             continue  # an agent never answers itself
@@ -66,14 +66,21 @@ async def get_webhook(channel: discord.TextChannel) -> discord.Webhook:
     return webhooks[channel.id]
 
 
-async def write_reply(agent: Agent, message: discord.Message) -> str | None:
+async def write_reply(agent: Agent, message: discord.Message, channel_name: str) -> str | None:
     """Ask Claude to reply as the agent. Returns None if there's nothing to say."""
     history = [m async for m in message.channel.history(limit=HISTORY_LIMIT)]
+    # A thread's history leaves out the message the thread was started from,
+    # which is usually the idea everyone is discussing. Fetch it separately.
+    if isinstance(message.channel, discord.Thread) and len(history) < HISTORY_LIMIT:
+        try:
+            history.append(await message.channel.parent.fetch_message(message.channel.id))
+        except discord.HTTPException:
+            pass  # this thread wasn't started from a message
     transcript = "\n".join(
         f"{m.author.display_name}: {m.content}" for m in reversed(history)
     )
     prompt = (
-        f"Recent messages in #{message.channel.name}, oldest first:\n\n"
+        f"Recent messages in #{channel_name}, oldest first:\n\n"
         f"{transcript}\n\n"
         f"{message.author.display_name} just mentioned you in the last message. "
         "Write your reply. Just the reply, no name prefix."
@@ -108,22 +115,28 @@ async def on_ready():
 
 @client.event
 async def on_message(message: discord.Message):
-    channel = message.channel
-    if not isinstance(channel, discord.TextChannel):
-        return  # ignore DMs and threads for now
+    # Agents listen in text channels and in threads inside them. `channel` is
+    # always the text channel: it decides which agents listen, and it's where
+    # the webhook, the cooldown, and !quiet live.
+    if isinstance(message.channel, discord.TextChannel):
+        channel = message.channel
+    elif isinstance(message.channel, discord.Thread) and isinstance(message.channel.parent, discord.TextChannel):
+        channel = message.channel.parent
+    else:
+        return  # ignore DMs, forum posts, and everything else
     now = time.monotonic()
 
     # The kill switch. Anyone can use it, no permissions check.
     if message.content.strip() == "!quiet":
         quiet_until[channel.id] = now + QUIET_SECONDS
-        await channel.send("🤫 The agents will stay quiet for 30 minutes.")
+        await message.channel.send("🤫 The agents will stay quiet for 30 minutes.")
         return
 
     # Work out how deep into an agent-to-agent chain this message is.
     # A human message is hop 0. Messages from other bots are ignored.
     our_webhook_ids = {w.id for w in webhooks.values()}
     if message.webhook_id in our_webhook_ids:
-        hop = chain_hop.get(channel.id, 0)
+        hop = chain_hop.get(message.channel.id, 0)
     elif message.author.bot:
         return
     else:
@@ -136,7 +149,7 @@ async def on_message(message: discord.Message):
     if hop == 0 and now < cooldown_until.get(channel.id, 0):
         return  # cooling down: stay silent rather than queueing
 
-    agent = pick_agent(message)
+    agent = pick_agent(message, channel.name)
     if agent is None:
         return
 
@@ -144,15 +157,23 @@ async def on_message(message: discord.Message):
     # thinking doesn't get its own reply.
     cooldown_until[channel.id] = now + COOLDOWN_SECONDS
 
-    reply = await write_reply(agent, message)
+    reply = await write_reply(agent, message, channel.name)
     if reply is None:
         return
+
+    # Each conversation lives in its own thread. A message in the main channel
+    # gets a new thread started on it; a message already in a thread is
+    # answered there.
+    if isinstance(message.channel, discord.Thread):
+        thread = message.channel
+    else:
+        thread = await message.create_thread(name=message.content[:100])
 
     # Record the hop count *before* sending. Discord can deliver our own message
     # back to on_message before send() even returns, and it needs the count.
     webhook = await get_webhook(channel)
-    chain_hop[channel.id] = hop + 1
-    await webhook.send(reply, username=agent.name, avatar_url=agent.avatar or None)
+    chain_hop[thread.id] = hop + 1
+    await webhook.send(reply, username=agent.name, avatar_url=agent.avatar or None, thread=thread)
 
 
 if __name__ == "__main__":
