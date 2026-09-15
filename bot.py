@@ -7,6 +7,7 @@ how 15 personas can share one bot instead of needing 15 bot accounts.
 
 import logging
 import os
+import re
 import time
 
 import anthropic
@@ -35,7 +36,7 @@ claude = anthropic.AsyncAnthropic()
 
 agents: list[Agent] = []
 webhooks: dict[int, discord.Webhook] = {}   # channel id -> our webhook there
-hops: dict[int, int] = {}                   # id of a message an agent sent -> its hop count
+chain_hop: dict[int, int] = {}              # channel id -> hop count of the last agent reply there
 cooldown_until: dict[int, float] = {}       # channel id -> time the cooldown ends
 quiet_until: dict[int, float] = {}          # channel id -> time `!quiet` ends
 
@@ -49,8 +50,10 @@ def pick_agent(message: discord.Message) -> Agent | None:
         if agent.name == message.author.name:
             continue  # an agent never answers itself
         # Personas aren't real Discord users, so they can't be @-mentioned the
-        # normal way. Typing "@The Skeptic" in plain text counts as a mention.
-        if agent.trigger == "mention" and f"@{agent.name.lower()}" in text:
+        # normal way. Instead, each agent's handle is its filename: typing
+        # "@skeptic" in plain text mentions the agent in agents/skeptic.md.
+        handle = agent.source.removesuffix(".md").lower()
+        if agent.trigger == "mention" and re.search(rf"@{re.escape(handle)}\b", text):
             return agent
     return None
 
@@ -118,8 +121,9 @@ async def on_message(message: discord.Message):
 
     # Work out how deep into an agent-to-agent chain this message is.
     # A human message is hop 0. Messages from other bots are ignored.
-    if message.webhook_id and message.id in hops:
-        hop = hops[message.id]
+    our_webhook_ids = {w.id for w in webhooks.values()}
+    if message.webhook_id in our_webhook_ids:
+        hop = chain_hop.get(channel.id, 0)
     elif message.author.bot:
         return
     else:
@@ -144,14 +148,11 @@ async def on_message(message: discord.Message):
     if reply is None:
         return
 
+    # Record the hop count *before* sending. Discord can deliver our own message
+    # back to on_message before send() even returns, and it needs the count.
     webhook = await get_webhook(channel)
-    sent = await webhook.send(
-        reply,
-        username=agent.name,
-        avatar_url=agent.avatar or None,
-        wait=True,  # wait for Discord to return the message, so we learn its id
-    )
-    hops[sent.id] = hop + 1
+    chain_hop[channel.id] = hop + 1
+    await webhook.send(reply, username=agent.name, avatar_url=agent.avatar or None)
 
 
 if __name__ == "__main__":
