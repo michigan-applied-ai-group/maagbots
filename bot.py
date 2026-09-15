@@ -39,6 +39,12 @@ webhooks: dict[int, discord.Webhook] = {}   # channel id -> our webhook there
 chain_hop: dict[int, int] = {}              # channel id -> hop count of the last agent reply there
 cooldown_until: dict[int, float] = {}       # channel id -> time the cooldown ends
 quiet_until: dict[int, float] = {}          # channel id -> time `!quiet` ends
+roles: dict[str, discord.Role] = {}         # agent handle -> its role (the club has one server)
+
+
+def handle_of(agent: Agent) -> str:
+    """An agent's handle is its filename: agents/skeptic.md is @skeptic."""
+    return agent.source.removesuffix(".md").lower()
 
 
 def pick_agent(message: discord.Message, channel_name: str) -> Agent | None:
@@ -50,12 +56,36 @@ def pick_agent(message: discord.Message, channel_name: str) -> Agent | None:
         if agent.name == message.author.name:
             continue  # an agent never answers itself
         # Personas aren't real Discord users, so they can't be @-mentioned the
-        # normal way. Instead, each agent's handle is its filename: typing
-        # "@skeptic" in plain text mentions the agent in agents/skeptic.md.
-        handle = agent.source.removesuffix(".md").lower()
-        if agent.trigger == "mention" and re.search(rf"@{re.escape(handle)}\b", text):
+        # normal way. Each agent gets a Discord role with its handle instead,
+        # so it shows up when someone types "@". Picking the role from that
+        # list and typing "@skeptic" as plain text both count as a mention.
+        handle = handle_of(agent)
+        role = roles.get(handle)
+        picked_role = role is not None and role.mention in message.content
+        typed_handle = re.search(rf"@{re.escape(handle)}\b", text)
+        if agent.trigger == "mention" and (picked_role or typed_handle):
             return agent
     return None
+
+
+async def create_roles(guild: discord.Guild):
+    """Make sure every agent has a mentionable role named after its handle.
+
+    Nobody is ever given these roles, so mentioning one notifies no one.
+    """
+    existing = {role.name: role for role in guild.roles}
+    for agent in agents:
+        handle = handle_of(agent)
+        try:
+            role = existing.get(handle) or await guild.create_role(
+                name=handle, mentionable=True, reason=f"maagbots agent {agent.name}"
+            )
+            if not role.mentionable:
+                await role.edit(mentionable=True)
+        except discord.Forbidden:
+            log.error("Can't create the @%s role. Give the bot the Manage Roles permission.", handle)
+            continue
+        roles[handle] = role
 
 
 async def get_webhook(channel: discord.TextChannel) -> discord.Webhook:
@@ -76,8 +106,9 @@ async def write_reply(agent: Agent, message: discord.Message, channel_name: str)
             history.append(await message.channel.parent.fetch_message(message.channel.id))
         except discord.HTTPException:
             pass  # this thread wasn't started from a message
+    # clean_content turns role mentions like <@&1234> back into "@skeptic".
     transcript = "\n".join(
-        f"{m.author.display_name}: {m.content}" for m in reversed(history)
+        f"{m.author.display_name}: {m.clean_content}" for m in reversed(history)
     )
     prompt = (
         f"Recent messages in #{channel_name}, oldest first:\n\n"
@@ -110,7 +141,9 @@ async def write_reply(agent: Agent, message: discord.Message, channel_name: str)
 
 @client.event
 async def on_ready():
-    log.info("Logged in as %s with %d agent(s)", client.user, len(agents))
+    for guild in client.guilds:
+        await create_roles(guild)
+    log.info("Logged in as %s with %d agent(s) and %d role(s)", client.user, len(agents), len(roles))
 
 
 @client.event
@@ -167,13 +200,24 @@ async def on_message(message: discord.Message):
     if isinstance(message.channel, discord.Thread):
         thread = message.channel
     else:
-        thread = await message.create_thread(name=message.content[:100])
+        thread = await message.create_thread(name=message.clean_content[:100])
+
+    # When an agent writes "@judge", swap in the real role mention so it's
+    # highlighted like any other mention.
+    for handle, role in roles.items():
+        reply = re.sub(rf"@{re.escape(handle)}\b", role.mention, reply, flags=re.IGNORECASE)
 
     # Record the hop count *before* sending. Discord can deliver our own message
     # back to on_message before send() even returns, and it needs the count.
     webhook = await get_webhook(channel)
     chain_hop[thread.id] = hop + 1
-    await webhook.send(reply, username=agent.name, avatar_url=agent.avatar or None, thread=thread)
+    await webhook.send(
+        reply,
+        username=agent.name,
+        avatar_url=agent.avatar or None,
+        thread=thread,
+        allowed_mentions=discord.AllowedMentions.none(),  # agents never ping anyone
+    )
 
 
 if __name__ == "__main__":
