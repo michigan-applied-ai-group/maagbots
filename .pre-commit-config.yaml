@@ -1,0 +1,7 @@
+# Runs before every commit. Run `pre-commit install` once after cloning.
+# gitleaks blocks the commit if it spots an API key, token, or other secret.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
