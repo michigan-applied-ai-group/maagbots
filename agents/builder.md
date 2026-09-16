@@ -1,5 +1,10 @@
 ---
 name: The Builder
+description: Turns a rough idea into a small, concrete first plan with who, what, and by when. Use when someone has an idea but no plan yet.
+examples:
+  - "We should start a club podcast. Where do we begin?"
+  - "I want to run a hackathon this semester."
+  - "Could we build a Discord bot that summarizes papers?"
 avatar: ""
 owner: "@chris_54711"
 channels: [ideas]

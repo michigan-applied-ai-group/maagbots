@@ -22,10 +22,11 @@ log = logging.getLogger("maagbots")
 
 MODEL = "claude-opus-5"
 HISTORY_LIMIT = 20          # how many recent messages an agent reads before replying
-MAX_HOPS = 3              # agent-to-agent chains stop after this many replies
+MAX_HOPS = 5            # agent-to-agent chains stop after this many replies
 COOLDOWN_SECONDS = 60       # after an agent replies, the channel rests this long
 QUIET_SECONDS = 30 * 60     # how long `!quiet` silences every agent
 DISCORD_MAX_LENGTH = 2000   # Discord rejects longer messages
+AMNESIA_MARKER = "🧠💨 The agents have forgotten everything above this line."
 
 # Discord only sends message text to bots that ask for the "message content"
 # intent. It also has to be switched on in the Developer Portal.
@@ -47,6 +48,14 @@ def handle_of(agent: Agent) -> str:
     return agent.source.removesuffix(".md").lower()
 
 
+def roster_entry(agent: Agent) -> str:
+    """How an agent is introduced to the other agents: handle, description, examples."""
+    entry = f"@{handle_of(agent)}: {agent.description or '(no description)'}"
+    for example in agent.examples:
+        entry += f'\n  e.g. "{example}"'
+    return entry
+
+
 def pick_agent(message: discord.Message, channel_name: str) -> Agent | None:
     """Return the one agent that should answer this message, or None."""
     text = message.content.lower()
@@ -65,6 +74,32 @@ def pick_agent(message: discord.Message, channel_name: str) -> Agent | None:
         typed_handle = re.search(rf"@{re.escape(handle)}\b", text)
         if agent.trigger == "mention" and (picked_role or typed_handle):
             return agent
+    return None
+
+
+async def continuing_agent(message: discord.Message, channel_name: str) -> Agent | None:
+    """Find the agent a thread follow-up is meant for, if any.
+
+    In a thread, the person who started it can keep talking to the agent who
+    spoke last, without typing an @mention. Anyone else still has to mention
+    an agent, so a thread full of people chatting doesn't trigger a reply to
+    every message. Both facts are read from Discord itself, so this still
+    works after the bot restarts.
+    """
+    thread = message.channel
+    try:
+        starter = await thread.parent.fetch_message(thread.id)
+    except discord.HTTPException:
+        return None  # this thread wasn't started from a message
+    if starter.author.id != message.author.id:
+        return None  # only the person who started the thread
+
+    async for earlier in thread.history(limit=HISTORY_LIMIT, before=message):
+        if earlier.webhook_id:  # agents post through webhooks
+            for agent in agents:
+                if agent.name == earlier.author.name and channel_name in agent.channels:
+                    return agent
+            return None  # the last agent to speak has since been removed
     return None
 
 
@@ -98,10 +133,19 @@ async def get_webhook(channel: discord.TextChannel) -> discord.Webhook:
 
 async def write_reply(agent: Agent, message: discord.Message, channel_name: str) -> str | None:
     """Ask Claude to reply as the agent. Returns None if there's nothing to say."""
-    history = [m async for m in message.channel.history(limit=HISTORY_LIMIT)]
+    # Agents don't store memories. Their memory is whatever they read here.
+    # Reading stops at the bot's last !amnesia marker, if there is one.
+    history = []
+    forgotten = False
+    async for m in message.channel.history(limit=HISTORY_LIMIT):
+        if m.author == client.user and m.content == AMNESIA_MARKER:
+            forgotten = True
+            break
+        history.append(m)
+
     # A thread's history leaves out the message the thread was started from,
     # which is usually the idea everyone is discussing. Fetch it separately.
-    if isinstance(message.channel, discord.Thread) and len(history) < HISTORY_LIMIT:
+    if isinstance(message.channel, discord.Thread) and not forgotten and len(history) < HISTORY_LIMIT:
         try:
             history.append(await message.channel.parent.fetch_message(message.channel.id))
         except discord.HTTPException:
@@ -110,10 +154,20 @@ async def write_reply(agent: Agent, message: discord.Message, channel_name: str)
     transcript = "\n".join(
         f"{m.author.display_name}: {m.clean_content}" for m in reversed(history)
     )
+    # Every agent is told who else is in the channel, using each agent's
+    # description. This is how a router agent knows where to send a question,
+    # so a vague description means your agent never gets picked.
+    roster = "\n".join(
+        roster_entry(other)
+        for other in agents
+        if other is not agent and channel_name in other.channels
+    )
     prompt = (
+        f"Other agents in #{channel_name}. Only tag one, by writing its @handle, "
+        f"if your instructions tell you to:\n\n{roster or '(none)'}\n\n"
         f"Recent messages in #{channel_name}, oldest first:\n\n"
         f"{transcript}\n\n"
-        f"{message.author.display_name} just mentioned you in the last message. "
+        f"The last message, from {message.author.display_name}, is addressed to you. "
         "Write your reply. Just the reply, no name prefix."
     )
 
@@ -165,6 +219,12 @@ async def on_message(message: discord.Message):
         await message.channel.send("🤫 The agents will stay quiet for 30 minutes.")
         return
 
+    # Wipe the agents' memory of this channel or thread. Nothing is deleted:
+    # the bot posts a marker, and agents never read past it.
+    if message.content.strip() == "!amnesia":
+        await message.channel.send(AMNESIA_MARKER)
+        return
+
     # Work out how deep into an agent-to-agent chain this message is.
     # A human message is hop 0. Messages from other bots are ignored.
     our_webhook_ids = {w.id for w in webhooks.values()}
@@ -179,16 +239,23 @@ async def on_message(message: discord.Message):
         return
     if hop >= MAX_HOPS:
         return  # the chain has gone far enough
-    if hop == 0 and now < cooldown_until.get(channel.id, 0):
+
+    # The cooldown only guards the main channel, where new threads start.
+    # Inside a thread, people are already in a conversation with the agents.
+    in_thread = isinstance(message.channel, discord.Thread)
+    if hop == 0 and not in_thread and now < cooldown_until.get(channel.id, 0):
         return  # cooling down: stay silent rather than queueing
 
     agent = pick_agent(message, channel.name)
+    if agent is None and hop == 0 and in_thread:
+        agent = await continuing_agent(message, channel.name)
     if agent is None:
         return
 
     # Start the cooldown now, so a second message arriving while Claude is
     # thinking doesn't get its own reply.
-    cooldown_until[channel.id] = now + COOLDOWN_SECONDS
+    if not in_thread:
+        cooldown_until[channel.id] = now + COOLDOWN_SECONDS
 
     reply = await write_reply(agent, message, channel.name)
     if reply is None:

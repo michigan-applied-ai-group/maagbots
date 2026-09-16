@@ -6,7 +6,7 @@ take down every other agent.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -24,6 +24,8 @@ class Agent:
     channels: list[str]
     trigger: str
     system_prompt: str
+    description: str = ""  # one line saying what the agent is for; routers read it
+    examples: list[str] = field(default_factory=list)  # sample requests it handles well
     avatar: str = ""
     enabled: bool = True
     source: str = ""  # which file this agent came from, for error messages
@@ -56,6 +58,10 @@ def parse_agent_file(path: Path) -> Agent:
             raise AgentFileError(f"missing required field '{field}'")
     if not isinstance(meta["channels"], list):
         raise AgentFileError("'channels' should be a list, like [ideas]")
+    if not isinstance(meta.get("examples", []), list):
+        raise AgentFileError(
+            "'examples' should be a list, with one '- \"example request\"' line per example"
+        )
     if meta["trigger"] not in TRIGGERS:
         raise AgentFileError(
             f"'trigger' is '{meta['trigger']}', but must be one of: "
@@ -70,6 +76,8 @@ def parse_agent_file(path: Path) -> Agent:
         channels=[str(c) for c in meta["channels"]],
         trigger=meta["trigger"],
         system_prompt=system_prompt,
+        description=str(meta.get("description") or "").strip(),
+        examples=[str(e).strip() for e in meta.get("examples") or []],
         avatar=str(meta.get("avatar") or ""),
         enabled=bool(meta.get("enabled", True)),
         source=path.name,
@@ -88,6 +96,12 @@ def load_agents(directory: Path = AGENTS_DIR) -> list[Agent]:
         if agent.enabled:
             agents.append(agent)
             log.info("Loaded %s from agents/%s", agent.name, path.name)
+            if not agent.description:
+                log.warning(
+                    "agents/%s has no 'description', so a router agent can't "
+                    "know when to send questions to it",
+                    path.name,
+                )
         else:
             log.info("agents/%s is disabled, skipping", path.name)
     return agents

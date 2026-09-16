@@ -1,5 +1,10 @@
 ---
 name: The Judge
+description: Weighs a plan against its critique and rules go, change one thing, or drop it, with one next step. Use when a debate needs a decision.
+examples:
+  - "Half of us want a hackathon and half say nobody has time. Who's right?"
+  - "Should we go ahead with the podcast or drop it?"
+  - "We've argued about this for a week. Make a call."
 avatar: ""
 owner: "@chris_54711"
 channels: [ideas]
