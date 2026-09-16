@@ -5,6 +5,7 @@ Discord webhook, which lets a single message use any name and avatar. That's
 how 15 personas can share one bot instead of needing 15 bot accounts.
 """
 
+import io
 import logging
 import os
 import re
@@ -14,6 +15,7 @@ import anthropic
 import discord
 from dotenv import load_dotenv
 
+import evolve
 from loader import Agent, load_agents
 
 load_dotenv()
@@ -58,23 +60,29 @@ def roster_entry(agent: Agent) -> str:
 
 def pick_agent(message: discord.Message, channel_name: str) -> Agent | None:
     """Return the one agent that should answer this message, or None."""
-    text = message.content.lower()
     for agent in agents:
         if channel_name not in agent.channels:
             continue
         if agent.name == message.author.name:
             continue  # an agent never answers itself
-        # Personas aren't real Discord users, so they can't be @-mentioned the
-        # normal way. Each agent gets a Discord role with its handle instead,
-        # so it shows up when someone types "@". Picking the role from that
-        # list and typing "@skeptic" as plain text both count as a mention.
-        handle = handle_of(agent)
-        role = roles.get(handle)
-        picked_role = role is not None and role.mention in message.content
-        typed_handle = re.search(rf"@{re.escape(handle)}\b", text)
-        if agent.trigger == "mention" and (picked_role or typed_handle):
+        if agent.trigger == "mention" and mentioned(agent, message.content):
             return agent
     return None
+
+
+def mentioned(agent: Agent, text: str) -> bool:
+    """Does this text mention the agent?
+
+    Personas aren't real Discord users, so they can't be @-mentioned the normal
+    way. Each agent gets a Discord role with its handle instead, so it shows up
+    when someone types "@". Picking the role from that list and typing
+    "@skeptic" as plain text both count as a mention.
+    """
+    handle = handle_of(agent)
+    role = roles.get(handle)
+    if role is not None and role.mention in text:
+        return True
+    return bool(re.search(rf"@{re.escape(handle)}\b", text.lower()))
 
 
 async def continuing_agent(message: discord.Message, channel_name: str) -> Agent | None:
@@ -193,6 +201,42 @@ async def write_reply(agent: Agent, message: discord.Message, channel_name: str)
     return text[:DISCORD_MAX_LENGTH] or None
 
 
+async def run_evolve(message: discord.Message, channel: discord.TextChannel):
+    """Handle `!evolve @skeptic`: propose a new version of that agent's file.
+
+    Nothing is written to agents/. The proposal comes back as an attachment,
+    and a human opens the pull request — merging it is how the club selects.
+    """
+    agent = next((a for a in agents if mentioned(a, message.content)), None)
+    if agent is None:
+        await message.channel.send("Say which agent to evolve, like `!evolve @skeptic`.")
+        return
+
+    async with message.channel.typing():
+        try:
+            samples = await evolve.collect_feedback(channel, agent)
+            summary, proposed, problems = await evolve.propose_rewrite(
+                agent, samples, claude, MODEL
+            )
+        except (anthropic.APIError, discord.HTTPException) as e:
+            log.error("Couldn't evolve %s: %s", agent.name, e)
+            await message.channel.send(f"Something went wrong evolving {agent.name}.")
+            return
+
+    if problems:
+        await message.channel.send(
+            f"No new {agent.name} this time — " + "; ".join(problems) + "."
+        )
+        return
+
+    await message.channel.send(
+        f"**A new {agent.name}**, grown from {len(samples)} of its replies.\n"
+        f"{summary}\n"
+        f"Open a pull request with this file to adopt it. Merging is how we choose.",
+        file=discord.File(io.BytesIO(proposed.encode("utf-8")), filename=agent.source),
+    )
+
+
 @client.event
 async def on_ready():
     for guild in client.guilds:
@@ -223,6 +267,11 @@ async def on_message(message: discord.Message):
     # the bot posts a marker, and agents never read past it.
     if message.content.strip() == "!amnesia":
         await message.channel.send(AMNESIA_MARKER)
+        return
+
+    # Let an agent rewrite itself, judged by the 👍/👎 its replies collected.
+    if message.content.strip().startswith("!evolve"):
+        await run_evolve(message, channel)
         return
 
     # Work out how deep into an agent-to-agent chain this message is.

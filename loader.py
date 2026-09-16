@@ -36,7 +36,12 @@ class AgentFileError(Exception):
 
 
 def parse_agent_file(path: Path) -> Agent:
-    text = path.read_text(encoding="utf-8")
+    """Read and parse one agent file from disk."""
+    return parse_agent_text(path.read_text(encoding="utf-8"), path.name)
+
+
+def parse_agent_text(text: str, source: str) -> Agent:
+    """Parse the contents of an agent file. `source` is its filename, for errors."""
 
     # The file must start with a `---` line, and a second `---` line ends the
     # frontmatter. Everything after that is the system prompt.
@@ -80,7 +85,7 @@ def parse_agent_file(path: Path) -> Agent:
         examples=[str(e).strip() for e in meta.get("examples") or []],
         avatar=str(meta.get("avatar") or ""),
         enabled=bool(meta.get("enabled", True)),
-        source=path.name,
+        source=source,
     )
 
 
