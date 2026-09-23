@@ -15,6 +15,7 @@ import anthropic
 import discord
 from dotenv import load_dotenv
 
+import adopt
 import evolve
 from loader import Agent, load_agents
 
@@ -237,6 +238,40 @@ async def run_evolve(message: discord.Message, channel: discord.TextChannel):
     )
 
 
+async def run_adopt(message: discord.Message):
+    """Handle `!adopt` in a thread: turn each student's description into an agent file.
+
+    Nothing is written to agents/. The files come back as attachments, and a
+    human opens the pull request.
+    """
+    if not isinstance(message.channel, discord.Thread):
+        await message.channel.send("Use `!adopt` inside the thread where people posted their agents.")
+        return
+
+    async with message.channel.typing():
+        try:
+            adopted, problems = await adopt.adopt_thread(message.channel, claude, MODEL)
+        except (anthropic.APIError, discord.HTTPException) as e:
+            log.error("Couldn't adopt agents: %s", e)
+            await message.channel.send("Something went wrong reading the descriptions.")
+            return
+
+    summary = f"**{len(adopted)} new agent(s)**: " + (
+        ", ".join(f"{a.author} ({a.filename})" for a in adopted) or "none found"
+    )
+    if problems:
+        summary += "\nProblems: " + "; ".join(problems)
+    await message.channel.send(summary[:DISCORD_MAX_LENGTH])
+
+    # Discord allows at most 10 attachments per message.
+    for start in range(0, len(adopted), 10):
+        files = [
+            discord.File(io.BytesIO(a.text.encode("utf-8")), filename=a.filename)
+            for a in adopted[start:start + 10]
+        ]
+        await message.channel.send(files=files)
+
+
 @client.event
 async def on_ready():
     for guild in client.guilds:
@@ -272,6 +307,11 @@ async def on_message(message: discord.Message):
     # Let an agent rewrite itself, judged by the 👍/👎 its replies collected.
     if message.content.strip().startswith("!evolve"):
         await run_evolve(message, channel)
+        return
+
+    # Turn the descriptions students posted in this thread into agent files.
+    if message.content.strip() == "!adopt":
+        await run_adopt(message)
         return
 
     # Work out how deep into an agent-to-agent chain this message is.
