@@ -172,8 +172,10 @@ async def write_reply(agent: Agent, message: discord.Message, channel_name: str)
         if other is not agent and channel_name in other.channels
     )
     prompt = (
-        f"Other agents in #{channel_name}. Only tag one, by writing its @handle, "
-        f"if your instructions tell you to:\n\n{roster or '(none)'}\n\n"
+        f"Other agents in #{channel_name}:\n\n{roster or '(none)'}\n\n"
+        "If one of them would have something to say about your reply, end by "
+        "tagging it with its @handle so it can answer you. Tag at most one "
+        "agent, and never tag yourself.\n\n"
         f"Recent messages in #{channel_name}, oldest first:\n\n"
         f"{transcript}\n\n"
         f"The last message, from {message.author.display_name}, is addressed to you. "
